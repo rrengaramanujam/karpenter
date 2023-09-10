@@ -1,89 +1,203 @@
-RELEASE_REPO ?= public.ecr.aws/karpenter
-RELEASE_VERSION ?= $(shell git describe --tags --always)
+export K8S_VERSION ?= 1.27.x
+export KUBEBUILDER_ASSETS ?= ${HOME}/.kubebuilder/bin
+CLUSTER_NAME ?= $(shell kubectl config view --minify -o jsonpath='{.clusters[].name}' | rev | cut -d"/" -f1 | rev | cut -d"." -f1)
 
 ## Inject the app version into project.Version
-LDFLAGS ?= "-ldflags=-X=github.com/aws/karpenter/pkg/utils/project.Version=$(RELEASE_VERSION)"
-GOFLAGS ?= "-tags=$(CLOUD_PROVIDER) $(LDFLAGS)"
-WITH_GOFLAGS = GOFLAGS=$(GOFLAGS)
-WITH_RELEASE_REPO = KO_DOCKER_REPO=$(RELEASE_REPO)
+ifdef SNAPSHOT_TAG
+LDFLAGS ?= -ldflags=-X=github.com/aws/karpenter/pkg/utils/project.Version=$(SNAPSHOT_TAG)
+else
+LDFLAGS ?= -ldflags=-X=github.com/aws/karpenter/pkg/utils/project.Version=$(shell git describe --tags --always)
+endif
+
+GOFLAGS ?= $(LDFLAGS)
+WITH_GOFLAGS = GOFLAGS="$(GOFLAGS)"
 
 ## Extra helm options
-CLUSTER_NAME ?= $(shell kubectl config view --minify -o jsonpath='{.clusters[].name}' | rev | cut -d"/" -f1 | rev)
 CLUSTER_ENDPOINT ?= $(shell kubectl config view --minify -o jsonpath='{.clusters[].cluster.server}')
-HELM_OPTS ?= --set controller.clusterName=${CLUSTER_NAME} --set controller.clusterEndpoint=${CLUSTER_ENDPOINT}
+AWS_ACCOUNT_ID ?= $(shell aws sts get-caller-identity --query Account --output text)
+KARPENTER_IAM_ROLE_ARN ?= arn:aws:iam::${AWS_ACCOUNT_ID}:role/${CLUSTER_NAME}-karpenter
+HELM_OPTS ?= --set serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn=${KARPENTER_IAM_ROLE_ARN} \
+      		--set settings.aws.clusterName=${CLUSTER_NAME} \
+			--set settings.aws.clusterEndpoint=${CLUSTER_ENDPOINT} \
+			--set settings.aws.defaultInstanceProfile=KarpenterNodeInstanceProfile-${CLUSTER_NAME} \
+			--set settings.aws.interruptionQueueName=${CLUSTER_NAME} \
+			--set settings.featureGates.driftEnabled=true \
+			--set controller.resources.requests.cpu=1 \
+			--set controller.resources.requests.memory=1Gi \
+			--set controller.resources.limits.cpu=1 \
+			--set controller.resources.limits.memory=1Gi \
+			--create-namespace
+
+# CR for local builds of Karpenter
+SYSTEM_NAMESPACE ?= karpenter
+KARPENTER_VERSION ?= $(shell git tag --sort=committerdate | tail -1)
+KO_DOCKER_REPO ?= ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/dev
+GETTING_STARTED_SCRIPT_DIR = website/content/en/preview/getting-started/getting-started-with-karpenter/scripts
+
+# Common Directories
+MOD_DIRS = $(shell find . -name go.mod -type f | xargs dirname)
+KARPENTER_CORE_DIR = $(shell go list -m -f '{{ .Dir }}' github.com/aws/karpenter-core)
+
+# TEST_SUITE enables you to select a specific test suite directory to run "make e2etests" or "make test" against
+TEST_SUITE ?= "..."
+TEST_TIMEOUT ?= "3h"
 
 help: ## Display help
 	@awk 'BEGIN {FS = ":.*##"; printf "Usage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
 
-dev: verify test ## Run all steps in the developer loop
+presubmit: verify test ## Run all steps in the developer loop
 
-ci: verify licenses battletest ## Run all steps used by continuous integration
+ci-test: battletest coverage ## Runs tests and submits coverage
 
-release: verify publish helm ## Run all steps in release workflow
+ci-non-test: verify licenses vulncheck ## Runs checks other than tests
+
+run: ## Run Karpenter controller binary against your local cluster
+	kubectl create configmap -n ${SYSTEM_NAMESPACE} karpenter-global-settings \
+		--from-literal=aws.clusterName=${CLUSTER_NAME} \
+		--from-literal=aws.clusterEndpoint=${CLUSTER_ENDPOINT} \
+		--from-literal=aws.defaultInstanceProfile=KarpenterNodeInstanceProfile-${CLUSTER_NAME} \
+		--from-literal=aws.interruptionQueueName=${CLUSTER_NAME} \
+		--from-literal=featureGates.driftEnabled=true \
+		--dry-run=client -o yaml | kubectl apply -f -
+
+
+	SYSTEM_NAMESPACE=${SYSTEM_NAMESPACE} KUBERNETES_MIN_VERSION="1.19.0-0" LEADER_ELECT=false DISABLE_WEBHOOK=true \
+		go run ./cmd/controller/main.go
+
+clean-run: ## Clean resources deployed by the run target
+	kubectl delete configmap -n ${SYSTEM_NAMESPACE} karpenter-global-settings --ignore-not-found
 
 test: ## Run tests
-	ginkgo -r
+	go test -v ./pkg/$(shell echo $(TEST_SUITE) | tr A-Z a-z)/... --ginkgo.focus="${FOCUS}" --ginkgo.vv
 
-battletest: ## Run stronger tests
-	# Ensure all files have cyclo-complexity =< 10
-	gocyclo -over 11 ./pkg
-	# Run randomized, parallelized, racing, code coveraged, tests
-	ginkgo -r \
+battletest: ## Run randomized, racing, code-covered tests
+	go test -v ./pkg/... \
+		-race \
 		-cover -coverprofile=coverage.out -outputdir=. -coverpkg=./pkg/... \
-		--randomizeAllSpecs --randomizeSuites -race
+		--ginkgo.focus="${FOCUS}" \
+		--ginkgo.randomize-all \
+		--ginkgo.vv \
+		-tags random_test_delay
+
+e2etests: ## Run the e2e suite against your local cluster
+	cd test && CLUSTER_NAME=${CLUSTER_NAME} go test \
+		-p 1 \
+		-count 1 \
+		-timeout ${TEST_TIMEOUT} \
+		-v \
+		./suites/$(shell echo $(TEST_SUITE) | tr A-Z a-z)/... \
+		--ginkgo.focus="${FOCUS}" \
+		--ginkgo.timeout=${TEST_TIMEOUT} \
+		--ginkgo.grace-period=3m \
+		--ginkgo.vv
+
+benchmark:
+	go test -tags=test_performance -run=NoTests -bench=. ./...
+
+deflake: ## Run randomized, racing, code-covered tests to deflake failures
+	for i in $(shell seq 1 5); do make battletest || exit 1; done
+
+deflake-until-it-fails: ## Run randomized, racing tests until the test fails to catch flakes
+	ginkgo \
+		--race \
+		--focus="${FOCUS}" \
+		--randomize-all \
+		--until-it-fails \
+		-v \
+		./pkg/...
+
+coverage:
 	go tool cover -html coverage.out -o coverage.html
 
-verify: codegen ## Verify code. Includes dependencies, linting, formatting, etc
-	go mod tidy
-	go mod download
-	go vet ./...
-	go fmt ./...
-	golangci-lint run
+verify: tidy download ## Verify code. Includes dependencies, linting, formatting, etc
+	go generate ./...
+	hack/boilerplate.sh
+	cp  $(KARPENTER_CORE_DIR)/pkg/apis/crds/* pkg/apis/crds
+	$(foreach dir,$(MOD_DIRS),cd $(dir) && golangci-lint run $(newline))
 	@git diff --quiet ||\
-		{ echo "New file modification detected in the Git working tree. Please check in before commit.";\
-		if [ $(MAKECMDGOALS) = 'ci' ]; then\
+		{ echo "New file modification detected in the Git working tree. Please check in before commit."; git --no-pager diff --name-only | uniq | awk '{print "  - " $$0}'; \
+		if [ "${CI}" = true ]; then\
 			exit 1;\
 		fi;}
+	@echo "Validating codegen/docgen build scripts..."
+	@find hack/code hack/docs -name "*.go" -type f -print0 | xargs -0 -I {} go build -o /dev/null {}
 
-licenses: ## Verifies dependency licenses and requires GITHUB_TOKEN to be set
-	go build $(GOFLAGS) -o karpenter cmd/controller/main.go
-	golicense hack/license-config.hcl karpenter
+vulncheck: ## Verify code vulnerabilities
+	@govulncheck ./pkg/...
 
-apply: ## Deploy the controller into your ~/.kube/config cluster
-	helm template --include-crds  karpenter charts/karpenter --namespace karpenter \
+licenses: download ## Verifies dependency licenses
+	! go-licenses csv ./... | grep -v -e 'MIT' -e 'Apache-2.0' -e 'BSD-3-Clause' -e 'BSD-2-Clause' -e 'ISC' -e 'MPL-2.0'
+
+setup: ## Sets up the IAM roles needed prior to deploying the karpenter-controller. This command only needs to be run once
+	CLUSTER_NAME=${CLUSTER_NAME} ./$(GETTING_STARTED_SCRIPT_DIR)/add-roles.sh $(KARPENTER_VERSION)
+
+image: ## Build the Karpenter controller images using ko build
+	$(eval CONTROLLER_IMG=$(shell $(WITH_GOFLAGS) KO_DOCKER_REPO="$(KO_DOCKER_REPO)" ko build --bare github.com/aws/karpenter/cmd/controller))
+	$(eval IMG_REPOSITORY=$(shell echo $(CONTROLLER_IMG) | cut -d "@" -f 1 | cut -d ":" -f 1))
+	$(eval IMG_TAG=$(shell echo $(CONTROLLER_IMG) | cut -d "@" -f 1 | cut -d ":" -f 2 -s))
+	$(eval IMG_DIGEST=$(shell echo $(CONTROLLER_IMG) | cut -d "@" -f 2))
+
+apply: image ## Deploy the controller from the current state of your git repository into your ~/.kube/config cluster
+	helm upgrade --install karpenter charts/karpenter --namespace ${SYSTEM_NAMESPACE} \
 		$(HELM_OPTS) \
-		--set controller.image=ko://github.com/aws/karpenter/cmd/controller \
-		--set webhook.image=ko://github.com/aws/karpenter/cmd/webhook \
-		| $(WITH_GOFLAGS) ko apply -B -f -
+		--set controller.image.repository=$(IMG_REPOSITORY) \
+		--set controller.image.tag=$(IMG_TAG) \
+		--set controller.image.digest=$(IMG_DIGEST)
+
+install:  ## Deploy the latest released version into your ~/.kube/config cluster
+	@echo Upgrading to ${KARPENTER_VERSION}
+	helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter --version ${KARPENTER_VERSION} --namespace ${SYSTEM_NAMESPACE} \
+		$(HELM_OPTS)
 
 delete: ## Delete the controller from your ~/.kube/config cluster
-	helm template karpenter charts/karpenter --namespace karpenter \
-		$(HELM_OPTS) \
-		--set serviceAccount.create=false \
-		| kubectl delete -f -
+	helm uninstall karpenter --namespace karpenter
 
-codegen: ## Generate code. Must be run if changes are made to ./pkg/apis/...
-	controller-gen \
-		object:headerFile="hack/boilerplate.go.txt" \
-		crd \
-		paths="./pkg/..." \
-		output:crd:artifacts:config=charts/karpenter/crds
-	hack/boilerplate.sh
-	hack/check-helm-docs.sh
+docgen: ## Generate docs
+	go run hack/docs/metrics_gen_docs.go pkg/ $(KARPENTER_CORE_DIR)/pkg website/content/en/preview/concepts/metrics.md
+	go run hack/docs/instancetypes_gen_docs.go website/content/en/preview/concepts/instance-types.md
+	go run hack/docs/configuration_gen_docs.go website/content/en/preview/concepts/settings.md
+	cd charts/karpenter && helm-docs
 
-publish: ## Generate release manifests and publish a versioned container image.
-	@aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin $(RELEASE_REPO)
-	yq e -i ".controller.image = \"$$($(WITH_RELEASE_REPO) $(WITH_GOFLAGS) ko publish -B -t $(RELEASE_VERSION) --platform all ./cmd/controller)\"" charts/karpenter/values.yaml
-	yq e -i ".webhook.image = \"$$($(WITH_RELEASE_REPO) $(WITH_GOFLAGS) ko publish -B -t $(RELEASE_VERSION) --platform all ./cmd/webhook)\"" charts/karpenter/values.yaml
-	yq e -i '.version = "$(subst v,,${RELEASE_VERSION})"' charts/karpenter/Chart.yaml
+codegen: ## Auto generate files based on AWS APIs response
+	$(WITH_GOFLAGS) ./hack/codegen.sh
 
-helm: ## Generate Helm Chart
-	cd charts;helm lint karpenter;helm package karpenter;helm repo index .
+stable-release-pr: ## Generate PR for stable release
+	$(WITH_GOFLAGS) ./hack/release/stable-pr.sh
 
-website: ## Generate Docs Website
-	cd website; npm install; git submodule update --init --recursive; hugo
+release: ## Builds and publishes stable release if env var RELEASE_VERSION is set, or a snapshot release otherwise
+	$(WITH_GOFLAGS) ./hack/release/release.sh
+
+release-crd: ## Packages and publishes a karpenter-crd helm chart
+	$(WITH_GOFLAGS) ./hack/release/release-crd.sh
+
+prepare-website: ## prepare the website for release
+	./hack/release/prepare-website.sh
 
 toolchain: ## Install developer toolchain
 	./hack/toolchain.sh
 
-.PHONY: help dev ci release test battletest verify codegen apply delete publish helm website toolchain licenses
+issues: ## Run GitHub issue analysis scripts
+	pip install -r ./hack/github/requirements.txt
+	@echo "Set GH_TOKEN env variable to avoid being rate limited by Github"
+	./hack/github/feature_request_reactions.py > "karpenter-feature-requests-$(shell date +"%Y-%m-%d").csv"
+	./hack/github/label_issue_count.py > "karpenter-labels-$(shell date +"%Y-%m-%d").csv"
+
+website: ## Serve the docs website locally
+	cd website && npm install && git submodule update --init --recursive && hugo server
+
+tidy: ## Recursively "go mod tidy" on all directories where go.mod exists
+	$(foreach dir,$(MOD_DIRS),cd $(dir) && go mod tidy $(newline))
+
+download: ## Recursively "go mod download" on all directories where go.mod exists
+	$(foreach dir,$(MOD_DIRS),cd $(dir) && go mod download $(newline))
+
+update-core: ## Update karpenter-core to latest
+	go get -u github.com/aws/karpenter-core@HEAD
+	go mod tidy
+
+.PHONY: help dev ci release test battletest e2etests verify tidy download docgen codegen apply delete toolchain licenses vulncheck issues website nightly snapshot
+
+define newline
+
+
+endef

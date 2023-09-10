@@ -16,21 +16,46 @@ limitations under the License.
 package apis
 
 import (
-	"github.com/aws/karpenter/pkg/apis/provisioning/v1alpha5"
+	_ "embed"
+
+	v1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"knative.dev/pkg/webhook/resourcesemantics"
+
+	"github.com/aws/karpenter-core/pkg/operator/scheme"
+	"github.com/aws/karpenter/pkg/apis/settings"
+	"github.com/aws/karpenter/pkg/apis/v1beta1"
+
+	"github.com/samber/lo"
+
+	"github.com/aws/karpenter-core/pkg/apis"
+	coresettings "github.com/aws/karpenter-core/pkg/apis/settings"
+	"github.com/aws/karpenter-core/pkg/utils/functional"
+	"github.com/aws/karpenter/pkg/apis/v1alpha1"
 )
 
 var (
 	// Builder includes all types within the apis package
 	Builder = runtime.NewSchemeBuilder(
-		v1alpha5.SchemeBuilder.AddToScheme,
+		v1alpha1.SchemeBuilder.AddToScheme,
+		v1beta1.SchemeBuilder.AddToScheme,
 	)
 	// AddToScheme may be used to add all resources defined in the project to a Scheme
 	AddToScheme = Builder.AddToScheme
-	// Resources defined in the project
-	Resources = map[schema.GroupVersionKind]resourcesemantics.GenericCRD{
-		v1alpha5.SchemeGroupVersion.WithKind("Provisioner"): &v1alpha5.Provisioner{},
-	}
+	Settings    = []coresettings.Injectable{&settings.Settings{}}
 )
+
+//go:generate controller-gen crd object:headerFile="../../hack/boilerplate.go.txt" paths="./..." output:crd:artifacts:config=crds
+var (
+	//go:embed crds/karpenter.k8s.aws_awsnodetemplates.yaml
+	AWSNodeTemplateCRD []byte
+	//go:embed crds/compute.k8s.aws_nodeclasses.yaml
+	NodeClassCRD []byte
+	CRDs         = append(apis.CRDs,
+		lo.Must(functional.Unmarshal[v1.CustomResourceDefinition](AWSNodeTemplateCRD)),
+		lo.Must(functional.Unmarshal[v1.CustomResourceDefinition](NodeClassCRD)),
+	)
+)
+
+func init() {
+	lo.Must0(AddToScheme(scheme.Scheme))
+}

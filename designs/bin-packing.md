@@ -15,7 +15,7 @@ this is not very efficient and can incur infrastructure costs for the
 user. In order to be able to schedule pods efficiently and be
 cost-effective, Karpenter packs these pods on to the available
 instance types with the given set of constraints. Karpenter follows
-the [First Fit Decreasing (FFD)](https://en.wikipedia.org/wiki/Bin_packing_problem#First_Fit_Decreasing_(FFD))
+the [First Fit Decreasing (FFD)](https://en.wikipedia.org/wiki/First-fit-decreasing_bin_packing)
 algorithm for bin packing the pods. The FFD technique chosen is less
 complex and relatively faster considering the number of pods and
 instance types available are not too high.
@@ -33,7 +33,7 @@ taken to bin pack each group individually:
     - If the pod doesn't fit this instance type, skip this instance
       type and select next bigger instance type.
     - If the pod fits this instance type, check all the remaining pods
-      from largest to smallest, and determing how many can also fit on
+      from largest to smallest, and determining how many can also fit on
       this given instance.
     - Compare all the instance types starting with the largest pod in
       step 3 and select the instance type into which the maximal

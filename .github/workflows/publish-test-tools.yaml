@@ -1,0 +1,23 @@
+name: PublishTestTools
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - test/Dockerfile
+      - test/push-docker.sh
+  schedule:
+    - cron: '0 13 * * MON'
+permissions:
+  id-token: write
+jobs:
+  publish-tools:
+    if: github.repository == 'aws/karpenter'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/install-deps
+      - uses: ./.github/actions/authenticate-aws
+      - run: ./push-docker.sh
+        working-directory: ./test

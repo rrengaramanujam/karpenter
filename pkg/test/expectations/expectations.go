@@ -12,177 +12,77 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package expecations
+package expectations
 
 import (
-	"context"
-	"fmt"
-	"sync"
-	"time"
-
-	//nolint:revive,stylecheck
-	. "github.com/onsi/gomega"
-	appsv1 "k8s.io/api/apps/v1"
+	. "github.com/onsi/gomega" //nolint:revive,stylecheck
+	"github.com/samber/lo"
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/api/policy/v1beta1"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/types"
-	"knative.dev/pkg/ptr"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	"github.com/aws/karpenter/pkg/apis/provisioning/v1alpha5"
-	"github.com/aws/karpenter/pkg/controllers/provisioning"
-	"github.com/aws/karpenter/pkg/controllers/scheduling"
+	"github.com/aws/karpenter/pkg/apis/v1alpha1"
+	"github.com/aws/karpenter/pkg/apis/v1beta1"
 )
 
-const (
-	ReconcilerPropagationTime = 10 * time.Second
-	RequestInterval           = 1 * time.Second
-)
-
-func ExpectPodExists(ctx context.Context, c client.Client, name string, namespace string) *v1.Pod {
-	pod := &v1.Pod{}
-	Expect(c.Get(context.Background(), client.ObjectKey{Name: name, Namespace: namespace}, pod)).To(Succeed())
-	return pod
-}
-
-func ExpectNodeExists(ctx context.Context, c client.Client, name string) *v1.Node {
-	node := &v1.Node{}
-	Expect(c.Get(context.Background(), client.ObjectKey{Name: name}, node)).To(Succeed())
-	return node
-}
-
-func ExpectNotFound(ctx context.Context, c client.Client, objects ...client.Object) {
-	for _, object := range objects {
-		Eventually(func() bool {
-			return errors.IsNotFound(c.Get(context.Background(), types.NamespacedName{Name: object.GetName(), Namespace: object.GetNamespace()}, object))
-		}, ReconcilerPropagationTime, RequestInterval).Should(BeTrue(), func() string {
-			return fmt.Sprintf("expected %s to be deleted, but it still exists", object.GetSelfLink())
-		})
+func ExpectBlockDeviceMappingsEqual(bdm1 []*v1alpha1.BlockDeviceMapping, bdm2 []*v1beta1.BlockDeviceMapping) {
+	// Expect that all BlockDeviceMappings are present and the same
+	// Ensure that they are the same by ensuring a consistent ordering
+	Expect(bdm1).To(HaveLen(len(bdm2)))
+	for i := range bdm1 {
+		Expect(lo.FromPtr(bdm1[i].DeviceName)).To(Equal(lo.FromPtr(bdm2[i].DeviceName)))
+		ExpectBlockDevicesEqual(bdm1[i].EBS, bdm2[i].EBS)
 	}
 }
 
-func ExpectScheduled(ctx context.Context, c client.Client, pod *v1.Pod) *v1.Node {
-	p := ExpectPodExists(ctx, c, pod.Name, pod.Namespace)
-	Expect(p.Spec.NodeName).ToNot(BeEmpty(), fmt.Sprintf("expected %s/%s to be scheduled", pod.Namespace, pod.Name))
-	return ExpectNodeExists(ctx, c, p.Spec.NodeName)
-}
-
-func ExpectNotScheduled(ctx context.Context, c client.Client, pod *v1.Pod) {
-	p := ExpectPodExists(ctx, c, pod.Name, pod.Namespace)
-	Eventually(p.Spec.NodeName).Should(BeEmpty(), fmt.Sprintf("expected %s/%s to not be scheduled", pod.Namespace, pod.Name))
-}
-
-func ExpectApplied(ctx context.Context, c client.Client, objects ...client.Object) {
-	for _, object := range objects {
-		if object.GetResourceVersion() == "" {
-			Expect(c.Create(context.Background(), object)).To(Succeed())
-		} else {
-			Expect(c.Update(context.Background(), object)).To(Succeed())
-		}
+func ExpectBlockDevicesEqual(bd1 *v1alpha1.BlockDevice, bd2 *v1beta1.BlockDevice) {
+	Expect(bd1 == nil).To(Equal(bd2 == nil))
+	if bd1 != nil {
+		Expect(lo.FromPtr(bd1.DeleteOnTermination)).To(Equal(lo.FromPtr(bd2.VolumeType)))
+		Expect(lo.FromPtr(bd1.Encrypted)).To(Equal(lo.FromPtr(bd2.Encrypted)))
+		Expect(lo.FromPtr(bd1.IOPS)).To(Equal(lo.FromPtr(bd2.IOPS)))
+		Expect(lo.FromPtr(bd1.KMSKeyID)).To(Equal(lo.FromPtr(bd2.KMSKeyID)))
+		Expect(lo.FromPtr(bd1.SnapshotID)).To(Equal(lo.FromPtr(bd2.SnapshotID)))
+		Expect(lo.FromPtr(bd1.Throughput)).To(Equal(lo.FromPtr(bd2.Throughput)))
+		Expect(lo.FromPtr(bd1.VolumeSize)).To(Equal(lo.FromPtr(bd2.VolumeSize)))
+		Expect(lo.FromPtr(bd1.VolumeType)).To(Equal(lo.FromPtr(bd2.VolumeType)))
 	}
 }
 
-func ExpectStatusUpdated(ctx context.Context, c client.Client, objects ...client.Object) {
-	for _, object := range objects {
-		Expect(c.Status().Update(context.Background(), object)).To(Succeed())
+func ExpectMetadataOptionsEqual(mo1 *v1alpha1.MetadataOptions, mo2 *v1beta1.MetadataOptions) {
+	Expect(mo1 == nil).To(Equal(mo2 == nil))
+	if mo1 != nil {
+		Expect(lo.FromPtr(mo1.HTTPEndpoint)).To(Equal(lo.FromPtr(mo2.HTTPEndpoint)))
+		Expect(lo.FromPtr(mo1.HTTPProtocolIPv6)).To(Equal(lo.FromPtr(mo2.HTTPProtocolIPv6)))
+		Expect(lo.FromPtr(mo1.HTTPPutResponseHopLimit)).To(Equal(lo.FromPtr(mo2.HTTPPutResponseHopLimit)))
+		Expect(lo.FromPtr(mo1.HTTPTokens)).To(Equal(lo.FromPtr(mo2.HTTPTokens)))
 	}
 }
 
-func ExpectCreated(ctx context.Context, c client.Client, objects ...client.Object) {
-	for _, object := range objects {
-		Expect(c.Create(context.Background(), object)).To(Succeed())
+func ExpectSubnetStatusEqual(subnets1 []v1alpha1.Subnet, subnets2 []v1beta1.Subnet) {
+	// Expect that all Subnet Status entries are present and the same
+	// Ensure that they are the same by ensuring a consistent ordering
+	Expect(subnets1).To(HaveLen(len(subnets2)))
+	for i := range subnets1 {
+		Expect(subnets1[i].ID).To(Equal(subnets2[i].ID))
+		Expect(subnets1[i].Zone).To(Equal(subnets2[i].Zone))
 	}
 }
 
-func ExpectCreatedWithStatus(ctx context.Context, c client.Client, objects ...client.Object) {
-	for _, object := range objects {
-		// Preserve a copy of the status, which is overriden by create
-		status := object.DeepCopyObject().(client.Object)
-		ExpectApplied(ctx, c, object)
-		Expect(c.Status().Update(context.Background(), status)).To(Succeed())
+func ExpectSecurityGroupStatusEqual(securityGroups1 []v1alpha1.SecurityGroup, securityGroups2 []v1beta1.SecurityGroup) {
+	// Expect that all SecurityGroup Status entries are present and the same
+	// Ensure that they are the same by ensuring a consistent ordering
+	Expect(securityGroups1).To(HaveLen(len(securityGroups2)))
+	for i := range securityGroups1 {
+		Expect(securityGroups1[i].ID).To(Equal(securityGroups2[i].ID))
+		Expect(securityGroups1[i].Name).To(Equal(securityGroups2[i].Name))
 	}
 }
 
-func ExpectDeleted(ctx context.Context, c client.Client, objects ...client.Object) {
-	for _, object := range objects {
-		persisted := object.DeepCopyObject()
-		object.SetFinalizers([]string{})
-		Expect(c.Patch(ctx, object, client.MergeFrom(persisted.(client.Object)))).To(Succeed())
-		if err := c.Delete(ctx, object, &client.DeleteOptions{GracePeriodSeconds: ptr.Int64(0)}); !errors.IsNotFound(err) {
-			Expect(err).To(BeNil())
-		}
+func ExpectAMIStatusEqual(amis1 []v1alpha1.AMI, amis2 []v1beta1.AMI) {
+	// Expect that all AMI Status entries are present and the same
+	Expect(amis1).To(HaveLen(len(amis2)))
+	for i := range amis1 {
+		Expect(amis1[i].ID).To(Equal(amis2[i].ID))
+		Expect(amis1[i].Name).To(Equal(amis2[i].Name))
+		Expect(amis1[i].Requirements).To(ConsistOf(lo.Map(amis2[i].Requirements, func(r v1.NodeSelectorRequirement, _ int) interface{} { return BeEquivalentTo(r) })...))
 	}
-	for _, object := range objects {
-		ExpectNotFound(ctx, c, object)
-	}
-}
-
-func ExpectCleanedUp(ctx context.Context, c client.Client) {
-	pdbs := v1beta1.PodDisruptionBudgetList{}
-	Expect(c.List(ctx, &pdbs)).To(Succeed())
-	for i := range pdbs.Items {
-		ExpectDeleted(ctx, c, &pdbs.Items[i])
-	}
-	pods := v1.PodList{}
-	Expect(c.List(ctx, &pods)).To(Succeed())
-	for i := range pods.Items {
-		ExpectDeleted(ctx, c, &pods.Items[i])
-	}
-	nodes := v1.NodeList{}
-	Expect(c.List(ctx, &nodes)).To(Succeed())
-	for i := range nodes.Items {
-		ExpectDeleted(ctx, c, &nodes.Items[i])
-	}
-	daemonsets := appsv1.DaemonSetList{}
-	Expect(c.List(ctx, &daemonsets)).To(Succeed())
-	for i := range daemonsets.Items {
-		ExpectDeleted(ctx, c, &daemonsets.Items[i])
-	}
-	provisioners := v1alpha5.ProvisionerList{}
-	Expect(c.List(ctx, &provisioners)).To(Succeed())
-	for i := range provisioners.Items {
-		ExpectDeleted(ctx, c, &provisioners.Items[i])
-	}
-}
-
-// ExpectProvisioningCleanedUp includes additional cleanup logic for provisioning workflows
-func ExpectProvisioningCleanedUp(ctx context.Context, c client.Client, controller *provisioning.Controller) {
-	provisioners := v1alpha5.ProvisionerList{}
-	Expect(c.List(ctx, &provisioners)).To(Succeed())
-	ExpectCleanedUp(ctx, c)
-	for i := range provisioners.Items {
-		ExpectReconcileSucceeded(ctx, controller, client.ObjectKeyFromObject(&provisioners.Items[i]))
-	}
-}
-
-func ExpectProvisioned(ctx context.Context, c client.Client, scheduler *scheduling.Controller, provisioners *provisioning.Controller, provisioner *v1alpha5.Provisioner, pods ...*v1.Pod) (result []*v1.Pod) {
-	// Persist objects
-	ExpectApplied(ctx, c, provisioner)
-	ExpectStatusUpdated(ctx, c, provisioner)
-	for _, pod := range pods {
-		ExpectCreatedWithStatus(ctx, c, pod)
-	}
-	// Wait for reconcile
-	ExpectReconcileSucceeded(ctx, provisioners, client.ObjectKeyFromObject(provisioner))
-	wg := sync.WaitGroup{}
-	for _, pod := range pods {
-		wg.Add(1)
-		go func(pod *v1.Pod) {
-			scheduler.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(pod)})
-			wg.Done()
-		}(pod)
-	}
-	wg.Wait()
-	// Return updated pods
-	for _, pod := range pods {
-		result = append(result, ExpectPodExists(ctx, c, pod.GetName(), pod.GetNamespace()))
-	}
-	return result
-}
-
-func ExpectReconcileSucceeded(ctx context.Context, reconciler reconcile.Reconciler, key client.ObjectKey) {
-	_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
-	Expect(err).ToNot(HaveOccurred())
 }

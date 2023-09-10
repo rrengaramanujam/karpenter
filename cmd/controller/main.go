@@ -15,100 +15,58 @@ limitations under the License.
 package main
 
 import (
-	"context"
-	"fmt"
+	"github.com/samber/lo"
 
-	"github.com/aws/karpenter/pkg/apis"
 	"github.com/aws/karpenter/pkg/cloudprovider"
-	"github.com/aws/karpenter/pkg/cloudprovider/registry"
 	"github.com/aws/karpenter/pkg/controllers"
-	"github.com/aws/karpenter/pkg/controllers/counter"
-	"github.com/aws/karpenter/pkg/controllers/metrics"
-	"github.com/aws/karpenter/pkg/controllers/node"
-	"github.com/aws/karpenter/pkg/controllers/provisioning"
-	"github.com/aws/karpenter/pkg/controllers/scheduling"
-	"github.com/aws/karpenter/pkg/controllers/termination"
-	"github.com/aws/karpenter/pkg/utils/injection"
-	"github.com/aws/karpenter/pkg/utils/options"
-	"github.com/go-logr/zapr"
-	"k8s.io/apimachinery/pkg/runtime"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/client-go/kubernetes"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/util/flowcontrol"
-	"knative.dev/pkg/configmap/informer"
-	knativeinjection "knative.dev/pkg/injection"
-	"knative.dev/pkg/injection/sharedmain"
-	"knative.dev/pkg/logging"
-	"knative.dev/pkg/signals"
-	"knative.dev/pkg/system"
-	controllerruntime "sigs.k8s.io/controller-runtime"
-)
+	"github.com/aws/karpenter/pkg/operator"
+	"github.com/aws/karpenter/pkg/webhooks"
 
-var (
-	scheme    = runtime.NewScheme()
-	opts      = options.MustParse()
-	component = "controller"
+	"github.com/aws/karpenter-core/pkg/cloudprovider/metrics"
+	corecontrollers "github.com/aws/karpenter-core/pkg/controllers"
+	"github.com/aws/karpenter-core/pkg/controllers/state"
+	coreoperator "github.com/aws/karpenter-core/pkg/operator"
+	corewebhooks "github.com/aws/karpenter-core/pkg/webhooks"
 )
-
-func init() {
-	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-	utilruntime.Must(apis.AddToScheme(scheme))
-}
 
 func main() {
-	if err := opts.Validate(); err != nil {
-		panic(fmt.Sprintf("Input parameter validation failed, %s", err.Error()))
-	}
+	ctx, op := operator.NewOperator(coreoperator.NewOperator())
+	awsCloudProvider := cloudprovider.New(
+		op.InstanceTypesProvider,
+		op.InstanceProvider,
+		op.EventRecorder,
+		op.GetClient(),
+		op.AMIProvider,
+		op.SecurityGroupProvider,
+		op.SubnetProvider,
+	)
+	lo.Must0(op.AddHealthzCheck("cloud-provider", awsCloudProvider.LivenessProbe))
+	cloudProvider := metrics.Decorate(awsCloudProvider)
 
-	config := controllerruntime.GetConfigOrDie()
-	config.RateLimiter = flowcontrol.NewTokenBucketRateLimiter(float32(opts.KubeClientQPS), opts.KubeClientBurst)
-	clientSet := kubernetes.NewForConfigOrDie(config)
-
-	// Set up logger and watch for changes to log level
-	ctx := LoggingContextOrDie(config, clientSet)
-	ctx = injection.WithConfig(ctx, config)
-	ctx = injection.WithOptions(ctx, opts)
-
-	// Set up controller runtime controller
-	cloudProvider := registry.NewCloudProvider(ctx, cloudprovider.Options{ClientSet: clientSet})
-	manager := controllers.NewManagerOrDie(config, controllerruntime.Options{
-		Logger:                 zapr.NewLogger(logging.FromContext(ctx).Desugar()),
-		LeaderElection:         true,
-		LeaderElectionID:       "karpenter-leader-election",
-		Scheme:                 scheme,
-		MetricsBindAddress:     fmt.Sprintf(":%d", opts.MetricsPort),
-		HealthProbeBindAddress: fmt.Sprintf(":%d", opts.HealthProbePort),
-	})
-
-	provisioners := provisioning.NewController(ctx, manager.GetClient(), clientSet.CoreV1(), cloudProvider)
-
-	if err := manager.RegisterControllers(ctx,
-		provisioners,
-		scheduling.NewController(manager.GetClient(), provisioners),
-		termination.NewController(ctx, manager.GetClient(), clientSet.CoreV1(), cloudProvider),
-		node.NewController(manager.GetClient()),
-		metrics.NewController(manager.GetClient(), cloudProvider),
-		counter.NewController(manager.GetClient()),
-	).Start(ctx); err != nil {
-		panic(fmt.Sprintf("Unable to start manager, %s", err.Error()))
-	}
-}
-
-// LoggingContextOrDie injects a logger into the returned context. The logger is
-// configured by the ConfigMap `config-logging` and live updates the level.
-func LoggingContextOrDie(config *rest.Config, clientSet *kubernetes.Clientset) context.Context {
-	ctx, startinformers := knativeinjection.EnableInjectionOrDie(signals.NewContext(), config)
-	logger, atomicLevel := sharedmain.SetupLoggerOrDie(ctx, component)
-	ctx = logging.WithLogger(ctx, logger)
-	rest.SetDefaultWarningHandler(&logging.WarningHandler{Logger: logger})
-	cmw := informer.NewInformedWatcher(clientSet, system.Namespace())
-	sharedmain.WatchLoggingConfigOrDie(ctx, cmw, logger, atomicLevel, component)
-	if err := cmw.Start(ctx.Done()); err != nil {
-		logger.Fatalf("Failed to watch logging configuration, %s", err.Error())
-	}
-	startinformers()
-	return ctx
+	op.
+		WithControllers(ctx, corecontrollers.NewControllers(
+			ctx,
+			op.Clock,
+			op.GetClient(),
+			op.KubernetesInterface,
+			state.NewCluster(op.Clock, op.GetClient(), cloudProvider),
+			op.EventRecorder,
+			cloudProvider,
+		)...).
+		WithWebhooks(ctx, corewebhooks.NewWebhooks()...).
+		WithControllers(ctx, controllers.NewControllers(
+			ctx,
+			op.Session,
+			op.Clock,
+			op.GetClient(),
+			op.EventRecorder,
+			op.UnavailableOfferingsCache,
+			awsCloudProvider,
+			op.SubnetProvider,
+			op.SecurityGroupProvider,
+			op.PricingProvider,
+			op.AMIProvider,
+		)...).
+		WithWebhooks(ctx, webhooks.NewWebhooks()...).
+		Start(ctx)
 }

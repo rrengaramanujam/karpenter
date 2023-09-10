@@ -1,6 +1,16 @@
-/karpenter
+# Go toolchain
 coverage.out
 coverage.html
 *.test
-website/node_modules
-website/resources
+*.cpuprofile
+*.heapprofile
+go.work
+go.work.sum
+
+# Environment
+.idea
+.vscode
+.DS_Store
+
+# Project Specific
+*.csv

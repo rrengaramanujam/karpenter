@@ -14,19 +14,6 @@ limitations under the License.
 
 package project
 
-import (
-	"path/filepath"
-	"runtime"
-)
-
-var (
-	// Version is the karpenter app version injected during compilation
-	// when using the Makefile
-	Version = "unspecified"
-)
-
-func RelativeToRoot(path string) string {
-	_, file, _, _ := runtime.Caller(0)
-	manifestsRoot := filepath.Join(filepath.Dir(file), "..", "..", "..")
-	return filepath.Join(manifestsRoot, path)
-}
+// Version is the karpenter app version injected during compilation
+// when using the Makefile
+var Version = "unspecified"
